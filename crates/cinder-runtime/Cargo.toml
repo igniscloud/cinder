@@ -1,0 +1,19 @@
+[package]
+name = "cinder-runtime"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+cinder-core = { path = "../cinder-core" }
+cinder-store-postgres = { path = "../cinder-store-postgres" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true

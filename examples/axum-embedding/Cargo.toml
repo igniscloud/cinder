@@ -1,0 +1,19 @@
+[package]
+name = "cinder-axum-embedding"
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+cinder-core = { path = "../../crates/cinder-core" }
+cinder-runtime = { path = "../../crates/cinder-runtime" }
+cinder-store-postgres = { path = "../../crates/cinder-store-postgres" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+

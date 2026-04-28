@@ -1,0 +1,15 @@
+[package]
+name = "cinder-store-postgres"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+cinder-core = { path = "../cinder-core" }
+chrono.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
