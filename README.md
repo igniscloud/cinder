@@ -5,16 +5,18 @@
 - multi-provider abstraction through `Provider`
 - custom tools through `Tool`
 - custom skills through `Skill`
-- Postgres checkpoints for runs, messages, and async tool tasks
+- SQLite or Postgres checkpoints for runs, messages, async tool tasks, and TaskPlans
 - inline tools for short work and resumable async tools for long work
-- run-level Postgres leases to prevent concurrent advancement of the same run
+- run-level store leases to prevent concurrent advancement of the same run
 - retry/backoff/dead-letter handling for async tool tasks
+- TaskPlan DAG orchestration for multi-agent workflows
 
 ## Crates
 
 - `cinder-core`: stable types and traits
 - `cinder-store-postgres`: Postgres schema and persistence
-- `cinder-runtime`: `create_agent`, `create_run`, `run_agent`, worker loop, lock/retry policy
+- `cinder-store-sqlite`: SQLite schema and persistence
+- `cinder-runtime`: `create_agent`, `create_run`, `run_agent`, worker loop, lock/retry policy, TaskPlan advancement
 
 The framework crates do not contain business logic. Your axum service owns prompts,
 providers, tools, skills, user auth, billing, and domain workflows. It embeds `cinder`
@@ -63,5 +65,28 @@ curl -sS http://127.0.0.1:3000/runs \
 ```
 
 Your real axum service should define its own providers and tools in the business
-crate, then depend on `cinder-core`, `cinder-runtime`, and `cinder-store-postgres`.
-# cinder
+crate, then depend on `cinder-core`, `cinder-runtime`, and the store crate you need.
+
+## Math Proof TaskPlan Example
+
+The example under `examples/math-proof-taskplan` ports the shape of Ignis
+`math-proof-lab` to Cinder TaskPlan. It registers literature, formal verifier,
+curriculum, pedagogy, and rigor critic agents, then runs a static DAG for a
+Fermat's Last Theorem proof-boundary request.
+
+It uses `examples/math-proof-taskplan/cinder.toml` for the database, provider,
+model alias, and agent definitions. Edit the API key directly in that file before
+running; environment variable config is intentionally not used in this phase.
+
+```bash
+cargo run --manifest-path examples/math-proof-taskplan/Cargo.toml \
+  examples/math-proof-taskplan/cinder.toml
+```
+
+## Built-in Tools
+
+`AgentRuntime::from_config` registers these tools automatically:
+
+- `cinder.list_agents`: returns each configured agent's id, description, provider, model, tools, and skills.
+- `cinder.spawn_task_plan`: creates a child TaskPlan from the current TaskPlan task and pauses the parent task until the child plan completes.
+- `cinder.submit_task`: submits the current TaskPlan task result or failure.

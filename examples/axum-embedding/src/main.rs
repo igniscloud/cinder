@@ -7,7 +7,7 @@ use axum::{
 };
 use cinder_core::{
     AgentSpec, CinderCoreError, Message, MessageRole, Provider, ProviderRequest, ProviderResponse,
-    Tool, ToolCall, ToolExecutionMode, ToolResult, ToolSpec,
+    Tool, ToolCall, ToolContext, ToolExecutionMode, ToolResult, ToolSpec,
 };
 use cinder_runtime::{AgentRuntime, CreateRun, RunAgentOutcome};
 use cinder_store_postgres::PostgresStore;
@@ -23,9 +23,8 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://cinder:cinder@127.0.0.1:55432/cinder".to_owned()
-    });
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://cinder:cinder@127.0.0.1:55432/cinder".to_owned());
     let bind: SocketAddr = std::env::var("BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
         .parse()?;
@@ -43,6 +42,7 @@ async fn main() -> Result<()> {
             id: "example_agent".to_owned(),
             provider: "example".to_owned(),
             model: "example-model".to_owned(),
+            description: "Example echo agent.".to_owned(),
             system_prompt: "You are a minimal framework embedding example.".to_owned(),
             tools: vec!["sleep_ms".to_owned()],
             skills: vec![],
@@ -108,10 +108,7 @@ async fn create_run(
     Json(run_response(run_id, outcome))
 }
 
-async fn resume_run(
-    State(state): State<AppState>,
-    Path(run_id): Path<Uuid>,
-) -> Json<RunResponse> {
+async fn resume_run(State(state): State<AppState>, Path(run_id): Path<Uuid>) -> Json<RunResponse> {
     let outcome = state
         .runtime
         .run_agent(run_id, None)
@@ -222,7 +219,11 @@ impl Tool for SleepTool {
         }
     }
 
-    async fn execute(&self, arguments: Value) -> Result<ToolResult, CinderCoreError> {
+    async fn execute(
+        &self,
+        _context: ToolContext,
+        arguments: Value,
+    ) -> Result<ToolResult, CinderCoreError> {
         let ms = arguments.get("ms").and_then(Value::as_u64).unwrap_or(0);
         sleep(Duration::from_millis(ms.min(5000))).await;
         Ok(ToolResult::text(json!({ "slept_ms": ms }).to_string()))

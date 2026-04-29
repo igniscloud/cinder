@@ -1,9 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use cinder_core::{
-    AgentSpec, Message, MessageRole, Provider, ProviderRequest, RunStatus, Skill, SkillSpec, Tool,
-    ToolExecutionMode, ToolSpec,
+    AgentSpec, CinderStore, Message, MessageRole, Provider, ProviderRequest, RunStatus, Skill,
+    SkillSpec, Tool, ToolContext, ToolExecutionMode, ToolSpec,
 };
-use cinder_store_postgres::PostgresStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,9 +10,16 @@ use tokio::time::sleep;
 use tracing::{debug, error};
 use uuid::Uuid;
 
+pub mod config;
+pub mod taskplan;
+pub mod tools;
+pub use config::OpenAiCompatibleProvider;
+pub use taskplan::{CreateTaskPlanRun, TaskPlanOutcome, TaskPlanRuntime, TaskPlanRuntimeOptions};
+pub use tools::{ListAgentsTool, SpawnTaskPlanTool, SubmitTaskTool};
+
 #[derive(Clone)]
 pub struct AgentRuntime {
-    store: PostgresStore,
+    store: Arc<dyn CinderStore>,
     providers: Arc<HashMap<String, Arc<dyn Provider>>>,
     tools: Arc<HashMap<String, Arc<dyn Tool>>>,
     skills: Arc<HashMap<String, Arc<dyn Skill>>>,
@@ -71,7 +77,7 @@ pub enum RunAgentOutcome {
 }
 
 pub struct AgentRuntimeBuilder {
-    store: PostgresStore,
+    store: Arc<dyn CinderStore>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
     skills: HashMap<String, Arc<dyn Skill>>,
@@ -79,9 +85,9 @@ pub struct AgentRuntimeBuilder {
 }
 
 impl AgentRuntimeBuilder {
-    pub fn new(store: PostgresStore) -> Self {
+    pub fn new(store: impl CinderStore + 'static) -> Self {
         Self {
-            store,
+            store: Arc::new(store),
             providers: HashMap::new(),
             tools: HashMap::new(),
             skills: HashMap::new(),
@@ -122,8 +128,42 @@ impl AgentRuntimeBuilder {
 }
 
 impl AgentRuntime {
-    pub fn builder(store: PostgresStore) -> AgentRuntimeBuilder {
+    pub fn builder(store: impl CinderStore + 'static) -> AgentRuntimeBuilder {
         AgentRuntimeBuilder::new(store)
+    }
+
+    pub async fn from_config(
+        store: impl CinderStore + 'static,
+        config: &cinder_core::CinderConfig,
+        base_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        config.validate().map_err(|err| anyhow!(err))?;
+        let mut builder = Self::builder(store)
+            .options(RuntimeOptions {
+                run_lease_seconds: config.runtime.run_lease_seconds,
+                max_internal_turns: config.runtime.max_internal_turns,
+                ..RuntimeOptions::default()
+            })
+            .tool(ListAgentsTool);
+        builder = builder.tool(SpawnTaskPlanTool).tool(SubmitTaskTool);
+
+        for (provider_id, provider_config) in &config.providers {
+            match provider_config {
+                cinder_core::ProviderConfig::OpenAiCompatible(provider_config) => {
+                    builder = builder.provider(OpenAiCompatibleProvider::from_config(
+                        provider_id.clone(),
+                        provider_config.clone(),
+                        config,
+                    ));
+                }
+            }
+        }
+
+        let runtime = builder.build();
+        for agent in config.agent_specs(base_dir).map_err(|err| anyhow!(err))? {
+            runtime.create_agent(agent).await?;
+        }
+        Ok(runtime)
     }
 
     pub async fn create_agent(&self, spec: AgentSpec) -> Result<()> {
@@ -303,15 +343,23 @@ impl AgentRuntime {
                 match tool.spec().execution_mode {
                     ToolExecutionMode::Inline => {
                         let result = tool
-                            .execute(tool_call.arguments.clone())
+                            .execute(
+                                self.tool_context(run_id, Some(&tool_call.id)).await?,
+                                tool_call.arguments.clone(),
+                            )
                             .await
                             .map_err(|err| anyhow!(err))?;
-                        self.store
-                            .append_message(
-                                run_id,
-                                &Message::tool(tool_call.id.clone(), result.content),
-                            )
-                            .await?;
+                        if result.append_message {
+                            self.store
+                                .append_message(
+                                    run_id,
+                                    &Message::tool(tool_call.id.clone(), result.content),
+                                )
+                                .await?;
+                        }
+                        if result.suspend_run {
+                            return Ok(RunAgentOutcome::WaitingForInput);
+                        }
                     }
                     ToolExecutionMode::Async => {
                         has_async_tool = true;
@@ -351,7 +399,14 @@ impl AgentRuntime {
             }
         };
 
-        match tool.execute(task.tool_call.arguments.clone()).await {
+        match tool
+            .execute(
+                self.tool_context(task.run_id, Some(&task.tool_call.id))
+                    .await?,
+                task.tool_call.arguments.clone(),
+            )
+            .await
+        {
             Ok(result) => {
                 let should_wake = self
                     .store
@@ -406,6 +461,15 @@ impl AgentRuntime {
                     .ok_or_else(|| anyhow!("tool not registered: {name}"))
             })
             .collect()
+    }
+
+    async fn tool_context(&self, run_id: Uuid, tool_call_id: Option<&str>) -> Result<ToolContext> {
+        Ok(ToolContext {
+            agents: self.store.list_agents().await?,
+            store: Some(self.store.clone()),
+            run_id: Some(run_id),
+            tool_call_id: tool_call_id.map(str::to_owned),
+        })
     }
 
     fn system_prompt_for_agent(&self, agent: &AgentSpec) -> Result<String> {

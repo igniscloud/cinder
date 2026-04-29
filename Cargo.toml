@@ -2,10 +2,12 @@
 members = [
     "crates/cinder-core",
     "crates/cinder-store-postgres",
+    "crates/cinder-store-sqlite",
     "crates/cinder-runtime",
 ]
 exclude = [
     "examples/axum-embedding",
+    "examples/math-proof-taskplan",
 ]
 resolver = "2"
 
@@ -20,8 +22,10 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
+jsonschema = { version = "0.17.1", default-features = false }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "uuid", "chrono", "json", "macros"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+toml = "0.8"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }

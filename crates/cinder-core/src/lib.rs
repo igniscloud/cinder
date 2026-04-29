@@ -4,7 +4,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use uuid::Uuid;
+
+pub mod config;
+pub mod store;
+pub mod taskplan;
+pub use config::{
+    AgentConfig, CinderConfig, ModelConfig, OpenAiCompatibleProviderConfig, PostgresStoreConfig,
+    ProviderConfig, ProviderKind, RuntimeConfig, SqliteStoreConfig, StoreConfig, StoreKind,
+};
+pub use store::CinderStore;
+pub use taskplan::{
+    apply_output_bindings, ready_task_ids, validate_plan, validate_task_output, ChildPlanLink,
+    OutputBinding, PlanRunStatus, TaskDependency, TaskPlan, TaskPlanRun, TaskRun, TaskSpec,
+    TaskState,
+};
 
 pub type JsonMap = BTreeMap<String, Value>;
 
@@ -99,6 +114,8 @@ pub struct AgentSpec {
     pub id: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub description: String,
     pub system_prompt: String,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -197,6 +214,29 @@ pub struct ToolResult {
     pub content: String,
     #[serde(default)]
     pub data: Value,
+    #[serde(default = "default_true")]
+    pub append_message: bool,
+    #[serde(default)]
+    pub suspend_run: bool,
+}
+
+#[derive(Clone)]
+pub struct ToolContext {
+    pub agents: Vec<AgentSpec>,
+    pub store: Option<Arc<dyn CinderStore>>,
+    pub run_id: Option<Uuid>,
+    pub tool_call_id: Option<String>,
+}
+
+impl Default for ToolContext {
+    fn default() -> Self {
+        Self {
+            agents: Vec::new(),
+            store: None,
+            run_id: None,
+            tool_call_id: None,
+        }
+    }
 }
 
 impl ToolResult {
@@ -204,8 +244,28 @@ impl ToolResult {
         Self {
             content: content.into(),
             data: Value::Null,
+            append_message: true,
+            suspend_run: false,
         }
     }
+
+    pub fn control(
+        content: impl Into<String>,
+        data: Value,
+        append_message: bool,
+        suspend_run: bool,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            data,
+            append_message,
+            suspend_run,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -304,12 +364,24 @@ impl std::str::FromStr for ToolTaskStatus {
 pub enum CinderCoreError {
     #[error("invalid {ty} value: {value}")]
     InvalidEnum { ty: &'static str, value: String },
+    #[error("invalid task plan: {0}")]
+    TaskPlan(String),
+    #[error("invalid config: {0}")]
+    Config(String),
     #[error("provider failed: {0}")]
     Provider(String),
     #[error("tool failed: {0}")]
     Tool(String),
+    #[error("serialization failed: {0}")]
+    Serde(String),
     #[error("store failed: {0}")]
     Store(String),
+}
+
+impl From<serde_json::Error> for CinderCoreError {
+    fn from(value: serde_json::Error) -> Self {
+        CinderCoreError::Serde(value.to_string())
+    }
 }
 
 #[async_trait]
@@ -323,7 +395,11 @@ pub trait Provider: Send + Sync {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
-    async fn execute(&self, arguments: Value) -> Result<ToolResult, CinderCoreError>;
+    async fn execute(
+        &self,
+        context: ToolContext,
+        arguments: Value,
+    ) -> Result<ToolResult, CinderCoreError>;
 }
 
 pub trait Skill: Send + Sync {

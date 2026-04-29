@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "required": ["task_plan"],
+  "properties": {
+    "task_plan": {
+      "type": "object",
+      "required": ["id", "root_task_id", "tasks"],
+      "properties": {
+        "id": { "type": "string" },
+        "root_task_id": { "type": "string" },
+        "tasks": { "type": "array" },
+        "dependencies": { "type": "array" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

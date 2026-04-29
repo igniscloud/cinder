@@ -1,15 +1,14 @@
 [package]
-name = "cinder-core"
+name = "cinder-store-sqlite"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+cinder-core = { path = "../cinder-core" }
 chrono.workspace = true
-jsonschema.workspace = true
-serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 uuid.workspace = true
