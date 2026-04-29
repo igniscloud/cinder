@@ -231,6 +231,10 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
 }
 
@@ -364,6 +368,8 @@ mod tests {
                 provider: "hpcai".to_owned(),
                 model: "other".to_owned(),
                 temperature: None,
+                context_tokens: None,
+                max_output_tokens: None,
                 max_tokens: None,
             },
         );

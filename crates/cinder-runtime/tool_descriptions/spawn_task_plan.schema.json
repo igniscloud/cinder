@@ -4,14 +4,70 @@
   "properties": {
     "task_plan": {
       "type": "object",
-      "required": ["id", "root_task_id", "tasks"],
+      "required": ["id", "tasks"],
       "properties": {
-        "id": { "type": "string" },
-        "root_task_id": { "type": "string" },
-        "tasks": { "type": "array" },
-        "dependencies": { "type": "array" }
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique id for this child plan."
+        },
+        "tasks": {
+          "type": "array",
+          "minItems": 1,
+          "description": "TaskSpec objects to execute in this child plan.",
+          "items": {
+            "type": "object",
+            "required": ["id", "agent_id", "prompt", "output_schema"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Unique task id within this plan."
+              },
+              "agent_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Configured agent id that will execute this task."
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Task-specific instructions for the agent."
+              },
+              "input": {
+                "description": "Initial JSON input for this task. Defaults to null/empty when omitted."
+              },
+              "output_schema": {
+                "type": "object",
+                "description": "JSON Schema that the task result must satisfy."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "Dependency edges. Each edge says that to_task waits for from_task. When from_task succeeds, all top-level fields from its output object are merged into to_task input.",
+          "items": {
+            "type": "object",
+            "required": ["from_task", "to_task"],
+            "properties": {
+              "from_task": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Upstream task id that must succeed first."
+              },
+              "to_task": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Downstream task id that waits for from_task."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

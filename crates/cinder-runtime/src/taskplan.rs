@@ -1,10 +1,10 @@
 use crate::{AgentRuntime, CreateRun, RunAgentOutcome};
 use anyhow::{anyhow, Context, Result};
 use cinder_core::{
-    apply_output_bindings, ready_task_ids, validate_task_output, CinderStore, Message,
-    PlanRunStatus, TaskPlan, TaskState,
+    apply_dependency_inputs, ready_task_ids, CinderStore, Message, PlanRunStatus, TaskPlan,
+    TaskState,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +77,8 @@ impl TaskPlanRuntime {
                 input.target_id.as_deref(),
                 input.parent_plan_run_id,
                 input.parent_task_id.as_deref(),
+                None,
+                None,
             )
             .await?;
         Ok(run.id)
@@ -155,12 +157,7 @@ impl TaskPlanRuntime {
             let states = states_by_task(&tasks);
             let outputs = outputs_by_task(&tasks);
             if tasks.iter().all(|task| task.state == TaskState::Succeeded) {
-                let result = outputs
-                    .get(&plan_run.plan.root_task_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!("root task `{}` has no output", plan_run.plan.root_task_id)
-                    })?;
+                let result = plan_result(&plan_run.plan, &outputs)?;
                 self.store
                     .complete_task_plan_run(plan_run_id, &result)
                     .await?;
@@ -188,7 +185,7 @@ impl TaskPlanRuntime {
     async fn poll_running_tasks(
         &self,
         plan_run_id: Uuid,
-        plan: &TaskPlan,
+        _plan: &TaskPlan,
         tasks: &[cinder_core::TaskRun],
     ) -> Result<bool> {
         let mut progressed = false;
@@ -202,19 +199,12 @@ impl TaskPlanRuntime {
             };
 
             match self.agent_runtime.run_agent(agent_run_id, None).await? {
-                RunAgentOutcome::Completed { content } => {
+                RunAgentOutcome::Completed { .. } => {
                     if self.task_is_succeeded(plan_run_id, &task.task_id).await? {
                         progressed = true;
                         continue;
                     }
-                    let task_spec = find_task(plan, &task.task_id)?;
-                    let output = parse_task_output(&content).with_context(|| {
-                        format!("task `{}` did not return valid JSON", task.task_id)
-                    })?;
-                    validate_task_output(task_spec, &output)?;
-                    self.store
-                        .succeed_task_run(plan_run_id, &task.task_id, &output)
-                        .await?;
+                    self.remind_submit_task(agent_run_id).await?;
                     progressed = true;
                 }
                 RunAgentOutcome::Failed { error } => {
@@ -280,6 +270,57 @@ impl TaskPlanRuntime {
         Ok(progressed)
     }
 
+    pub async fn advance_parent_run_child_plans(&self, parent_run_id: Uuid) -> Result<bool> {
+        let plans = self
+            .store
+            .list_undelivered_task_plan_runs_by_parent_run(parent_run_id)
+            .await?;
+        let mut progressed = false;
+        for plan in plans {
+            let tool_call_id = plan
+                .parent_tool_call_id
+                .clone()
+                .ok_or_else(|| anyhow!("child plan `{}` has no parent tool call id", plan.id))?;
+            match self.advance_plan(plan.id).await? {
+                TaskPlanOutcome::Completed { result } => {
+                    self.store
+                        .append_message(
+                            parent_run_id,
+                            &Message::tool(tool_call_id, serde_json::to_string(&result)?),
+                        )
+                        .await?;
+                    self.store.mark_task_plan_parent_delivered(plan.id).await?;
+                    self.store
+                        .update_run_status(parent_run_id, cinder_core::RunStatus::Running, None)
+                        .await?;
+                    let _ = self.agent_runtime.run_agent(parent_run_id, None).await?;
+                    progressed = true;
+                }
+                TaskPlanOutcome::Failed { error } => {
+                    let result = serde_json::json!({
+                        "status": "failed",
+                        "plan_run_id": plan.id,
+                        "error": error
+                    });
+                    self.store
+                        .append_message(
+                            parent_run_id,
+                            &Message::tool(tool_call_id, serde_json::to_string(&result)?),
+                        )
+                        .await?;
+                    self.store.mark_task_plan_parent_delivered(plan.id).await?;
+                    self.store
+                        .update_run_status(parent_run_id, cinder_core::RunStatus::Running, None)
+                        .await?;
+                    let _ = self.agent_runtime.run_agent(parent_run_id, None).await?;
+                    progressed = true;
+                }
+                TaskPlanOutcome::Running | TaskPlanOutcome::Busy => {}
+            }
+        }
+        Ok(progressed)
+    }
+
     async fn start_ready_task(
         &self,
         plan_run_id: Uuid,
@@ -288,7 +329,7 @@ impl TaskPlanRuntime {
         outputs: &BTreeMap<String, Value>,
     ) -> Result<()> {
         let task_spec = find_task(plan, task_id)?;
-        let input = apply_output_bindings(plan, task_id, &task_spec.input, outputs)?;
+        let input = apply_dependency_inputs(plan, task_id, &task_spec.input, outputs)?;
         let agent_run_id = self
             .agent_runtime
             .create_run(CreateRun {
@@ -303,19 +344,14 @@ impl TaskPlanRuntime {
 
         match self
             .agent_runtime
-            .run_agent(agent_run_id, Some(task_prompt(plan, task_spec, &input)))
+            .run_agent(agent_run_id, Some(task_bootstrap_prompt(plan, task_spec)))
             .await?
         {
-            RunAgentOutcome::Completed { content } => {
+            RunAgentOutcome::Completed { .. } => {
                 if self.task_is_succeeded(plan_run_id, task_id).await? {
                     return Ok(());
                 }
-                let output = parse_task_output(&content)
-                    .with_context(|| format!("task `{task_id}` did not return valid JSON"))?;
-                validate_task_output(task_spec, &output)?;
-                self.store
-                    .succeed_task_run(plan_run_id, task_id, &output)
-                    .await?;
+                self.remind_submit_task(agent_run_id).await?;
             }
             RunAgentOutcome::Failed { error } => {
                 self.store
@@ -336,6 +372,21 @@ impl TaskPlanRuntime {
             .await?
             .into_iter()
             .any(|task| task.task_id == task_id && task.state == TaskState::Succeeded))
+    }
+
+    async fn remind_submit_task(&self, agent_run_id: Uuid) -> Result<()> {
+        self.store
+            .append_message(
+                agent_run_id,
+                &Message::user(
+                    "Your Cinder TaskPlan task is still open. Call cinder.get_task if you need the task details, then complete it with cinder.submit_task. A normal assistant message does not complete the task.",
+                ),
+            )
+            .await?;
+        self.store
+            .update_run_status(agent_run_id, cinder_core::RunStatus::Running, None)
+            .await?;
+        Ok(())
     }
 
     pub fn spawn_worker(
@@ -388,64 +439,43 @@ fn outputs_by_task(tasks: &[cinder_core::TaskRun]) -> BTreeMap<String, Value> {
         .collect()
 }
 
-fn task_prompt(plan: &TaskPlan, task: &cinder_core::TaskSpec, input: &Value) -> String {
+fn plan_result(plan: &TaskPlan, outputs: &BTreeMap<String, Value>) -> Result<Value> {
+    let terminal_task_ids = plan
+        .tasks
+        .iter()
+        .filter(|task| {
+            !plan
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.from_task == task.id)
+        })
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+
+    if terminal_task_ids.is_empty() {
+        return Err(anyhow!("task plan `{}` has no terminal task", plan.id));
+    }
+
+    let mut result = Map::new();
+    for task_id in terminal_task_ids {
+        let output = outputs
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("terminal task `{task_id}` has no output"))?;
+        result.insert(task_id.to_owned(), output);
+    }
+    Ok(Value::Object(result))
+}
+
+fn task_bootstrap_prompt(plan: &TaskPlan, task: &cinder_core::TaskSpec) -> String {
     format!(
-        r#"You are executing one task in a Cinder TaskPlan.
+        r#"A Cinder TaskPlan task is ready for you.
 
 Plan id: {plan_id}
 Task id: {task_id}
 
-Task instructions:
-{prompt}
-
-Input JSON:
-{input}
-
-Output JSON schema:
-{schema}
-
-If the `cinder.submit_task` tool is available, use it to submit the final result.
-If you need specialist sub-work and `cinder.spawn_task_plan` is available, call it once and wait for the runtime to resume you with the child result.
-If no TaskPlan submission tool is available, return only one valid JSON object and do not wrap it in Markdown."#,
+Call `cinder.get_task` to fetch the task prompt, input JSON, and output schema. When finished, call `cinder.submit_task`; do not treat a normal assistant message as task completion."#,
         plan_id = plan.id,
         task_id = task.id,
-        prompt = task.prompt,
-        input = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
-        schema = serde_json::to_string_pretty(&task.output_schema)
-            .unwrap_or_else(|_| task.output_schema.to_string()),
     )
-}
-
-fn parse_task_output(content: &str) -> Result<Value> {
-    if let Ok(value) = serde_json::from_str::<Value>(content.trim()) {
-        return Ok(value);
-    }
-
-    if let Some(value) = parse_fenced_json(content)? {
-        return Ok(value);
-    }
-
-    let start = content
-        .find('{')
-        .ok_or_else(|| anyhow!("missing JSON object start"))?;
-    let end = content
-        .rfind('}')
-        .ok_or_else(|| anyhow!("missing JSON object end"))?;
-    serde_json::from_str(&content[start..=end]).map_err(Into::into)
-}
-
-fn parse_fenced_json(content: &str) -> Result<Option<Value>> {
-    let Some(start) = content.find("```") else {
-        return Ok(None);
-    };
-    let rest = &content[start + 3..];
-    let body = rest
-        .strip_prefix("json")
-        .or_else(|| rest.strip_prefix("JSON"))
-        .unwrap_or(rest);
-    let Some(end) = body.find("```") else {
-        return Ok(None);
-    };
-    let fenced = body[..end].trim();
-    Ok(Some(serde_json::from_str(fenced)?))
 }

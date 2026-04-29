@@ -103,6 +103,8 @@ impl PostgresStore {
         target_id: Option<&str>,
         parent_plan_run_id: Option<Uuid>,
         parent_task_id: Option<&str>,
+        parent_agent_run_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<TaskPlanRun, StoreError> {
         cinder_core::validate_plan(plan)?;
         let plan_run_id = Uuid::new_v4();
@@ -111,21 +113,24 @@ impl PostgresStore {
         let row = sqlx::query(
             r#"
             INSERT INTO ai_task_plan_runs (
-                id, plan, root_task_id, status, parent_plan_run_id,
-                parent_task_id, user_id, target_id
+                id, plan, status, parent_plan_run_id,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                user_id, target_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, plan, status, result, last_error, parent_plan_run_id,
-                parent_task_id, user_id, target_id, locked_at, locked_by,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                parent_delivered_at, user_id, target_id, locked_at, locked_by,
                 created_at, updated_at
             "#,
         )
         .bind(plan_run_id)
         .bind(serde_json::to_value(plan)?)
-        .bind(&plan.root_task_id)
         .bind(PlanRunStatus::Running.to_string())
         .bind(parent_plan_run_id)
         .bind(parent_task_id)
+        .bind(parent_agent_run_id)
+        .bind(parent_tool_call_id)
         .bind(user_id)
         .bind(target_id)
         .fetch_one(&mut *tx)
@@ -157,7 +162,8 @@ impl PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, plan, status, result, last_error, parent_plan_run_id,
-                parent_task_id, user_id, target_id, locked_at, locked_by,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                parent_delivered_at, user_id, target_id, locked_at, locked_by,
                 created_at, updated_at
             FROM ai_task_plan_runs
             WHERE id = $1
@@ -205,6 +211,46 @@ impl PostgresStore {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(task_run_from_row).transpose()
+    }
+
+    pub async fn list_undelivered_task_plan_runs_by_parent_run(
+        &self,
+        parent_agent_run_id: Uuid,
+    ) -> Result<Vec<TaskPlanRun>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, plan, status, result, last_error, parent_plan_run_id,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                parent_delivered_at, user_id, target_id, locked_at, locked_by,
+                created_at, updated_at
+            FROM ai_task_plan_runs
+            WHERE parent_agent_run_id = $1
+              AND parent_delivered_at IS NULL
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(parent_agent_run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(task_plan_run_from_row).collect()
+    }
+
+    pub async fn mark_task_plan_parent_delivered(
+        &self,
+        plan_run_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            UPDATE ai_task_plan_runs
+            SET parent_delivered_at = now(), updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(plan_run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn acquire_task_plan_lock(
@@ -579,9 +625,9 @@ impl PostgresStore {
     ) -> Result<RunMessage, StoreError> {
         let row = sqlx::query(
             r#"
-            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, run_id, role, content, tool_calls, tool_call_id, created_at
+            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id, provider_metadata)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, run_id, role, content, tool_calls, tool_call_id, provider_metadata, created_at
             "#,
         )
         .bind(run_id)
@@ -589,6 +635,7 @@ impl PostgresStore {
         .bind(&message.content)
         .bind(serde_json::to_value(&message.tool_calls)?)
         .bind(&message.tool_call_id)
+        .bind(&message.provider_metadata)
         .fetch_one(&self.pool)
         .await?;
 
@@ -598,7 +645,7 @@ impl PostgresStore {
     pub async fn list_messages(&self, run_id: Uuid) -> Result<Vec<RunMessage>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, run_id, role, content, tool_calls, tool_call_id, created_at
+            SELECT id, run_id, role, content, tool_calls, tool_call_id, provider_metadata, created_at
             FROM ai_messages
             WHERE run_id = $1
             ORDER BY id ASC
@@ -690,8 +737,8 @@ impl PostgresStore {
 
         sqlx::query(
             r#"
-            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id)
-            VALUES ($1, $2, $3, '[]'::jsonb, $4)
+            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id, provider_metadata)
+            VALUES ($1, $2, $3, '[]'::jsonb, $4, '{}'::jsonb)
             "#,
         )
         .bind(run_id)
@@ -887,6 +934,7 @@ fn message_from_row(row: &sqlx::postgres::PgRow) -> Result<RunMessage, StoreErro
         content: row.try_get("content")?,
         tool_calls: serde_json::from_value(tool_calls)?,
         tool_call_id: row.try_get("tool_call_id")?,
+        provider_metadata: row.try_get("provider_metadata")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -920,6 +968,9 @@ fn task_plan_run_from_row(row: &sqlx::postgres::PgRow) -> Result<TaskPlanRun, St
         last_error: row.try_get("last_error")?,
         parent_plan_run_id: row.try_get("parent_plan_run_id")?,
         parent_task_id: row.try_get("parent_task_id")?,
+        parent_agent_run_id: row.try_get("parent_agent_run_id")?,
+        parent_tool_call_id: row.try_get("parent_tool_call_id")?,
+        parent_delivered_at: row.try_get("parent_delivered_at")?,
         user_id: row.try_get("user_id")?,
         target_id: row.try_get("target_id")?,
         locked_at: row.try_get("locked_at")?,
@@ -1101,6 +1152,8 @@ impl CinderStore for PostgresStore {
         target_id: Option<&str>,
         parent_plan_run_id: Option<Uuid>,
         parent_task_id: Option<&str>,
+        parent_agent_run_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<TaskPlanRun, CinderCoreError> {
         PostgresStore::create_task_plan_run(
             self,
@@ -1109,6 +1162,8 @@ impl CinderStore for PostgresStore {
             target_id,
             parent_plan_run_id,
             parent_task_id,
+            parent_agent_run_id,
+            parent_tool_call_id,
         )
         .await
         .map_err(Into::into)
@@ -1134,6 +1189,24 @@ impl CinderStore for PostgresStore {
         agent_run_id: Uuid,
     ) -> Result<Option<TaskRun>, CinderCoreError> {
         PostgresStore::get_task_run_by_agent_run(self, agent_run_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_undelivered_task_plan_runs_by_parent_run(
+        &self,
+        parent_agent_run_id: Uuid,
+    ) -> Result<Vec<TaskPlanRun>, CinderCoreError> {
+        PostgresStore::list_undelivered_task_plan_runs_by_parent_run(self, parent_agent_run_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_task_plan_parent_delivered(
+        &self,
+        plan_run_id: Uuid,
+    ) -> Result<(), CinderCoreError> {
+        PostgresStore::mark_task_plan_parent_delivered(self, plan_run_id)
             .await
             .map_err(Into::into)
     }

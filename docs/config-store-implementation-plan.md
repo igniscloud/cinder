@@ -31,7 +31,8 @@ alias = "kimi25"
 provider = "hpcai"
 model = "moonshotai/kimi-k2.5"
 temperature = 0.2
-max_tokens = 4096
+context_tokens = 1048576
+max_output_tokens = 4096
 
 [agents.orchestrator]
 model = "kimi25"

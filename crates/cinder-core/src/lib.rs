@@ -16,9 +16,8 @@ pub use config::{
 };
 pub use store::CinderStore;
 pub use taskplan::{
-    apply_output_bindings, ready_task_ids, validate_plan, validate_task_output, ChildPlanLink,
-    OutputBinding, PlanRunStatus, TaskDependency, TaskPlan, TaskPlanRun, TaskRun, TaskSpec,
-    TaskState,
+    apply_dependency_inputs, ready_task_ids, validate_plan, validate_task_output, ChildPlanLink,
+    PlanRunStatus, TaskDependency, TaskPlan, TaskPlanRun, TaskRun, TaskSpec, TaskState,
 };
 
 pub type JsonMap = BTreeMap<String, Value>;
@@ -141,6 +140,8 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub provider_metadata: Value,
 }
 
 impl Message {
@@ -150,6 +151,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_metadata: Value::Null,
         }
     }
 
@@ -159,6 +161,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_metadata: Value::Null,
         }
     }
 
@@ -168,6 +171,21 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            provider_metadata: Value::Null,
+        }
+    }
+
+    pub fn assistant_with_metadata(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        provider_metadata: Value,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+            provider_metadata,
         }
     }
 
@@ -177,6 +195,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            provider_metadata: Value::Null,
         }
     }
 }
@@ -290,6 +309,7 @@ pub struct RunMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+    pub provider_metadata: Value,
     pub created_at: DateTime<Utc>,
 }
 
@@ -300,6 +320,7 @@ impl From<RunMessage> for Message {
             content: value.content,
             tool_calls: value.tool_calls,
             tool_call_id: value.tool_call_id,
+            provider_metadata: value.provider_metadata,
         }
     }
 }

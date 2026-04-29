@@ -204,16 +204,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cinder-math-proof-taskplan"
+name = "cinder-math-proof-solver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "cinder-core",
  "cinder-runtime",
- "cinder-store-postgres",
- "cinder-store-sqlite",
- "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -227,6 +223,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cinder-core",
+ "cinder-store-postgres",
+ "cinder-store-sqlite",
  "reqwest",
  "serde",
  "serde_json",

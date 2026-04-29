@@ -40,8 +40,12 @@ CREATE TABLE IF NOT EXISTS ai_messages (
     content TEXT NOT NULL DEFAULT '',
     tool_calls JSONB NOT NULL DEFAULT '[]'::jsonb,
     tool_call_id TEXT,
+    provider_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE ai_messages
+    ADD COLUMN IF NOT EXISTS provider_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_ai_messages_run_id_id ON ai_messages(run_id, id);
 
@@ -65,12 +69,14 @@ CREATE INDEX IF NOT EXISTS idx_ai_tool_tasks_claim
 CREATE TABLE IF NOT EXISTS ai_task_plan_runs (
     id UUID PRIMARY KEY,
     plan JSONB NOT NULL,
-    root_task_id TEXT NOT NULL,
     status TEXT NOT NULL,
     result JSONB,
     last_error TEXT,
     parent_plan_run_id UUID REFERENCES ai_task_plan_runs(id) ON DELETE CASCADE,
     parent_task_id TEXT,
+    parent_agent_run_id UUID REFERENCES ai_runs(id) ON DELETE CASCADE,
+    parent_tool_call_id TEXT,
+    parent_delivered_at TIMESTAMPTZ,
     user_id TEXT,
     target_id TEXT,
     locked_at TIMESTAMPTZ,
@@ -82,6 +88,8 @@ CREATE TABLE IF NOT EXISTS ai_task_plan_runs (
 CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_status ON ai_task_plan_runs(status);
 CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_parent
     ON ai_task_plan_runs(parent_plan_run_id, parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_parent_agent
+    ON ai_task_plan_runs(parent_agent_run_id, parent_delivered_at);
 CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_lock ON ai_task_plan_runs(locked_at);
 
 CREATE TABLE IF NOT EXISTS ai_task_plan_task_runs (

@@ -262,7 +262,7 @@ async fn e2e_tool_failures_retry_then_dead_letter() {
 }
 
 #[tokio::test]
-async fn e2e_task_plan_runs_static_dag_with_bindings() {
+async fn e2e_task_plan_runs_static_dag_with_dependency_inputs() {
     let Some(database_url) = database_url() else {
         eprintln!("skipping e2e test: set CINDER_DATABASE_URL");
         return;
@@ -276,6 +276,7 @@ async fn e2e_task_plan_runs_static_dag_with_bindings() {
 
     let agent_runtime = AgentRuntime::builder(store.clone())
         .provider(TaskPlanProvider)
+        .tool(SubmitTaskTool)
         .build();
     for agent_id in ["research_agent", "summary_agent"] {
         agent_runtime
@@ -285,7 +286,7 @@ async fn e2e_task_plan_runs_static_dag_with_bindings() {
                 model: "test-model".to_owned(),
                 description: "".to_owned(),
                 system_prompt: "taskplan test agent".to_owned(),
-                tools: vec![],
+                tools: vec![SubmitTaskTool::NAME.to_owned()],
                 skills: vec![],
             })
             .await
@@ -297,7 +298,6 @@ async fn e2e_task_plan_runs_static_dag_with_bindings() {
         .create_plan_run(CreateTaskPlanRun {
             plan: TaskPlan {
                 id: "proof_test".to_owned(),
-                root_task_id: "summary".to_owned(),
                 tasks: vec![
                     TaskSpec {
                         id: "research".to_owned(),
@@ -329,10 +329,6 @@ async fn e2e_task_plan_runs_static_dag_with_bindings() {
                 dependencies: vec![TaskDependency {
                     from_task: "research".to_owned(),
                     to_task: "summary".to_owned(),
-                    bindings: vec![cinder_core::OutputBinding {
-                        from_pointer: "/findings".to_owned(),
-                        to_pointer: "/research_findings".to_owned(),
-                    }],
                 }],
             },
             user_id: Some("u1".to_owned()),
@@ -350,7 +346,7 @@ async fn e2e_task_plan_runs_static_dag_with_bindings() {
     assert_eq!(
         outcome,
         TaskPlanOutcome::Completed {
-            result: json!({ "markdown": "summary saw 1 findings" })
+            result: json!({ "summary": { "markdown": "summary saw 1 findings" } })
         }
     );
 }
@@ -364,6 +360,7 @@ async fn sqlite_runs_agent_and_task_plan() {
 
     let agent_runtime = AgentRuntime::builder(store.clone())
         .provider(TaskPlanProvider)
+        .tool(SubmitTaskTool)
         .build();
     for agent_id in ["research_agent", "summary_agent"] {
         agent_runtime
@@ -373,7 +370,7 @@ async fn sqlite_runs_agent_and_task_plan() {
                 model: "test-model".to_owned(),
                 description: "".to_owned(),
                 system_prompt: "taskplan test agent".to_owned(),
-                tools: vec![],
+                tools: vec![SubmitTaskTool::NAME.to_owned()],
                 skills: vec![],
             })
             .await
@@ -404,7 +401,6 @@ async fn sqlite_runs_agent_and_task_plan() {
         .create_plan_run(CreateTaskPlanRun {
             plan: TaskPlan {
                 id: "sqlite_proof_test".to_owned(),
-                root_task_id: "summary".to_owned(),
                 tasks: vec![
                     TaskSpec {
                         id: "research".to_owned(),
@@ -432,10 +428,6 @@ async fn sqlite_runs_agent_and_task_plan() {
                 dependencies: vec![TaskDependency {
                     from_task: "research".to_owned(),
                     to_task: "summary".to_owned(),
-                    bindings: vec![cinder_core::OutputBinding {
-                        from_pointer: "/findings".to_owned(),
-                        to_pointer: "/research_findings".to_owned(),
-                    }],
                 }],
             },
             user_id: None,
@@ -453,7 +445,7 @@ async fn sqlite_runs_agent_and_task_plan() {
     assert_eq!(
         outcome,
         TaskPlanOutcome::Completed {
-            result: json!({ "markdown": "summary saw 1 findings" })
+            result: json!({ "summary": { "markdown": "summary saw 1 findings" } })
         }
     );
 }
@@ -503,7 +495,6 @@ async fn sqlite_task_plan_can_spawn_child_plan_and_submit_task() {
         .create_plan_run(CreateTaskPlanRun {
             plan: TaskPlan {
                 id: "recursive_root".to_owned(),
-                root_task_id: "root".to_owned(),
                 tasks: vec![TaskSpec {
                     id: "root".to_owned(),
                     agent_id: "parent_agent".to_owned(),
@@ -532,7 +523,77 @@ async fn sqlite_task_plan_can_spawn_child_plan_and_submit_task() {
     assert_eq!(
         outcome,
         TaskPlanOutcome::Completed {
-            result: json!({ "markdown": "parent received child result" })
+            result: json!({ "root": { "markdown": "parent received child result" } })
+        }
+    );
+}
+
+#[tokio::test]
+async fn sqlite_main_agent_can_spawn_task_plan_and_resume() {
+    let store = SqliteStore::connect(":memory:")
+        .await
+        .expect("connect sqlite");
+    store.init_schema().await.expect("init sqlite schema");
+
+    let agent_runtime = AgentRuntime::builder(store.clone())
+        .provider(RecursiveTaskPlanProvider)
+        .tool(SpawnTaskPlanTool)
+        .tool(SubmitTaskTool)
+        .build();
+    agent_runtime
+        .create_agent(AgentSpec {
+            id: "main_agent".to_owned(),
+            provider: "recursive_taskplan".to_owned(),
+            model: "test-model".to_owned(),
+            description: "Main test agent.".to_owned(),
+            system_prompt: "main".to_owned(),
+            tools: vec![SpawnTaskPlanTool::NAME.to_owned()],
+            skills: vec![],
+        })
+        .await
+        .expect("create main agent");
+    agent_runtime
+        .create_agent(AgentSpec {
+            id: "child_agent".to_owned(),
+            provider: "recursive_taskplan".to_owned(),
+            model: "test-model".to_owned(),
+            description: "Child test agent.".to_owned(),
+            system_prompt: "child".to_owned(),
+            tools: vec![SubmitTaskTool::NAME.to_owned()],
+            skills: vec![],
+        })
+        .await
+        .expect("create child agent");
+
+    let plan_runtime = TaskPlanRuntime::new(store, agent_runtime.clone());
+    let run_id = agent_runtime
+        .create_run(CreateRun {
+            agent_id: "main_agent".to_owned(),
+            user_id: None,
+            target_id: None,
+        })
+        .await
+        .expect("create main run");
+
+    let outcome = agent_runtime
+        .run_agent(run_id, Some("Root solver request".to_owned()))
+        .await
+        .expect("run main agent");
+    assert_eq!(outcome, RunAgentOutcome::WaitingForInput);
+
+    assert!(plan_runtime
+        .advance_parent_run_child_plans(run_id)
+        .await
+        .expect("advance child plan"));
+
+    let outcome = agent_runtime
+        .run_agent(run_id, None)
+        .await
+        .expect("resume main agent");
+    assert_eq!(
+        outcome,
+        RunAgentOutcome::Completed {
+            content: "main received child result".to_owned()
         }
     );
 }
@@ -708,6 +769,33 @@ impl Provider for TaskPlanProvider {
             .map(|message| message.content.as_str())
             .unwrap_or_default();
 
+        let can_submit = request
+            .tools
+            .iter()
+            .any(|tool| tool.name == SubmitTaskTool::NAME);
+        if can_submit && user.contains("A Cinder TaskPlan task is ready") {
+            let result = if user.contains("Task id: research") {
+                json!({ "findings": ["Ribet plus Wiles"] })
+            } else if user.contains("Task id: summary") {
+                json!({ "markdown": "summary saw 1 findings" })
+            } else {
+                json!({ "markdown": "unknown task" })
+            };
+            return Ok(ProviderResponse {
+                message: Message::assistant(
+                    "",
+                    vec![ToolCall {
+                        id: format!("call-{}", Uuid::new_v4()),
+                        name: SubmitTaskTool::NAME.to_owned(),
+                        arguments: json!({
+                            "status": "succeeded",
+                            "result": result
+                        }),
+                    }],
+                ),
+            });
+        }
+
         let content = if user.contains("Task id: research") {
             json!({ "findings": ["Ribet plus Wiles"] }).to_string()
         } else if user.contains("Task id: summary") {
@@ -742,6 +830,43 @@ impl Provider for RecursiveTaskPlanProvider {
             .map(|message| message.content.as_str())
             .unwrap_or_default();
 
+        if user.contains("Root solver request") {
+            if matches!(last.map(|message| message.role), Some(MessageRole::Tool)) {
+                return Ok(ProviderResponse {
+                    message: Message::assistant("main received child result", vec![]),
+                });
+            }
+
+            return Ok(ProviderResponse {
+                message: Message::assistant(
+                    "",
+                    vec![ToolCall {
+                        id: format!("call-{}", Uuid::new_v4()),
+                        name: SpawnTaskPlanTool::NAME.to_owned(),
+                        arguments: json!({
+                            "task_plan": {
+                                "id": "main_child_plan",
+                                "tasks": [{
+                                    "id": "child",
+                                    "agent_id": "child_agent",
+                                    "prompt": "Submit child result.",
+                                    "input": {},
+                                    "output_schema": {
+                                        "type": "object",
+                                        "required": ["markdown"],
+                                        "properties": {
+                                            "markdown": { "type": "string" }
+                                        }
+                                    }
+                                }],
+                                "dependencies": []
+                            }
+                        }),
+                    }],
+                ),
+            });
+        }
+
         if user.contains("Task id: root") {
             if matches!(last.map(|message| message.role), Some(MessageRole::Tool)) {
                 return Ok(ProviderResponse {
@@ -768,7 +893,6 @@ impl Provider for RecursiveTaskPlanProvider {
                         arguments: json!({
                             "task_plan": {
                                 "id": "recursive_child",
-                                "root_task_id": "child",
                                 "tasks": [{
                                     "id": "child",
                                     "agent_id": "child_agent",

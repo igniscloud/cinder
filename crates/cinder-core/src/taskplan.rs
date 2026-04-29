@@ -2,7 +2,7 @@ use crate::CinderCoreError;
 use chrono::{DateTime, Utc};
 use jsonschema::JSONSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use uuid::Uuid;
@@ -10,7 +10,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskPlan {
     pub id: String,
-    pub root_task_id: String,
     #[serde(default)]
     pub tasks: Vec<TaskSpec>,
     #[serde(default)]
@@ -31,14 +30,6 @@ pub struct TaskSpec {
 pub struct TaskDependency {
     pub from_task: String,
     pub to_task: String,
-    #[serde(default)]
-    pub bindings: Vec<OutputBinding>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OutputBinding {
-    pub from_pointer: String,
-    pub to_pointer: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +142,9 @@ pub struct TaskPlanRun {
     pub last_error: Option<String>,
     pub parent_plan_run_id: Option<Uuid>,
     pub parent_task_id: Option<String>,
+    pub parent_agent_run_id: Option<Uuid>,
+    pub parent_tool_call_id: Option<String>,
+    pub parent_delivered_at: Option<DateTime<Utc>>,
     pub user_id: Option<String>,
     pub target_id: Option<String>,
     pub locked_at: Option<DateTime<Utc>>,
@@ -176,7 +170,6 @@ pub struct TaskRun {
 
 pub fn validate_plan(plan: &TaskPlan) -> Result<(), CinderCoreError> {
     validate_non_empty(&plan.id, "plan.id")?;
-    validate_non_empty(&plan.root_task_id, "plan.root_task_id")?;
     if plan.tasks.is_empty() {
         return taskplan_err("task plan must contain at least one task");
     }
@@ -195,13 +188,6 @@ pub fn validate_plan(plan: &TaskPlan) -> Result<(), CinderCoreError> {
                 task.id
             ))
         })?;
-    }
-
-    if !task_ids.contains(&plan.root_task_id) {
-        return taskplan_err(format!(
-            "root_task_id `{}` does not reference a task",
-            plan.root_task_id
-        ));
     }
 
     for dependency in &plan.dependencies {
@@ -224,10 +210,6 @@ pub fn validate_plan(plan: &TaskPlan) -> Result<(), CinderCoreError> {
                 "dependency to_task `{}` does not reference a task",
                 dependency.to_task
             ));
-        }
-        for binding in &dependency.bindings {
-            validate_json_pointer(&binding.from_pointer, "binding.from_pointer")?;
-            validate_json_pointer(&binding.to_pointer, "binding.to_pointer")?;
         }
     }
 
@@ -259,7 +241,7 @@ pub fn ready_task_ids(
     Ok(ready)
 }
 
-pub fn apply_output_bindings(
+pub fn apply_dependency_inputs(
     plan: &TaskPlan,
     task_id: &str,
     base_input: &Value,
@@ -273,7 +255,15 @@ pub fn apply_output_bindings(
         ));
     }
 
-    let mut input = base_input.clone();
+    let mut input = match base_input {
+        Value::Null => Value::Object(serde_json::Map::new()),
+        Value::Object(_) => base_input.clone(),
+        _ => {
+            return taskplan_err(format!(
+                "task `{task_id}` input must be an object when dependency inputs are merged"
+            ));
+        }
+    };
     for dependency in plan
         .dependencies
         .iter()
@@ -285,15 +275,7 @@ pub fn apply_output_bindings(
                 dependency.from_task
             ))
         })?;
-        for binding in &dependency.bindings {
-            let value = output.pointer(&binding.from_pointer).ok_or_else(|| {
-                CinderCoreError::TaskPlan(format!(
-                    "output pointer `{}` not found in task `{}` output",
-                    binding.from_pointer, dependency.from_task
-                ))
-            })?;
-            set_json_pointer(&mut input, &binding.to_pointer, value.clone())?;
-        }
+        merge_output_fields(&mut input, &dependency.from_task, output)?;
     }
     Ok(input)
 }
@@ -376,77 +358,23 @@ fn validate_json_schema(schema: &Value) -> Result<(), CinderCoreError> {
         .map_err(|error| CinderCoreError::TaskPlan(error.to_string()))
 }
 
-fn validate_json_pointer(pointer: &str, field: &str) -> Result<(), CinderCoreError> {
-    if pointer.is_empty() || pointer.starts_with('/') {
-        Ok(())
-    } else {
-        taskplan_err(format!("{field} must be an RFC 6901 JSON pointer"))
-    }
-}
-
-fn set_json_pointer(
-    target: &mut Value,
-    pointer: &str,
-    value: Value,
+fn merge_output_fields(
+    input: &mut Value,
+    from_task: &str,
+    output: &Value,
 ) -> Result<(), CinderCoreError> {
-    validate_json_pointer(pointer, "to_pointer")?;
-    if pointer.is_empty() {
-        *target = value;
-        return Ok(());
-    }
-
-    let tokens = pointer
-        .split('/')
-        .skip(1)
-        .map(unescape_pointer_token)
-        .collect::<Result<Vec<_>, _>>()?;
-    if tokens.is_empty() {
-        *target = value;
-        return Ok(());
-    }
-
-    let mut current = target;
-    for token in &tokens[..tokens.len() - 1] {
-        if !current.is_object() {
-            *current = Value::Object(Map::new());
-        }
-        let object = current.as_object_mut().ok_or_else(|| {
-            CinderCoreError::TaskPlan("to_pointer can only create object paths".to_owned())
-        })?;
-        current = object
-            .entry(token.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-    }
-
-    if !current.is_object() {
-        *current = Value::Object(Map::new());
-    }
-    let object = current.as_object_mut().ok_or_else(|| {
-        CinderCoreError::TaskPlan("to_pointer can only set object fields".to_owned())
+    let input_object = input.as_object_mut().ok_or_else(|| {
+        CinderCoreError::TaskPlan("task input must be an object after initialization".to_owned())
     })?;
-    let last = tokens
-        .last()
-        .ok_or_else(|| CinderCoreError::TaskPlan("to_pointer cannot be empty here".to_owned()))?;
-    object.insert(last.clone(), value);
-    Ok(())
-}
-
-fn unescape_pointer_token(token: &str) -> Result<String, CinderCoreError> {
-    let mut output = String::new();
-    let mut chars = token.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '~' {
-            output.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('0') => output.push('~'),
-            Some('1') => output.push('/'),
-            Some(other) => return taskplan_err(format!("invalid JSON pointer escape `~{other}`")),
-            None => return taskplan_err("invalid trailing JSON pointer escape"),
-        }
+    let output_object = output.as_object().ok_or_else(|| {
+        CinderCoreError::TaskPlan(format!(
+            "task `{from_task}` output must be an object to merge into downstream input"
+        ))
+    })?;
+    for (key, value) in output_object {
+        input_object.insert(key.clone(), value.clone());
     }
-    Ok(output)
+    Ok(())
 }
 
 fn taskplan_err<T>(message: impl Into<String>) -> Result<T, CinderCoreError> {
@@ -461,7 +389,6 @@ mod tests {
     fn sample_plan() -> TaskPlan {
         TaskPlan {
             id: "plan_1".to_owned(),
-            root_task_id: "synthesis".to_owned(),
             tasks: vec![
                 TaskSpec {
                     id: "research".to_owned(),
@@ -487,10 +414,6 @@ mod tests {
             dependencies: vec![TaskDependency {
                 from_task: "research".to_owned(),
                 to_task: "synthesis".to_owned(),
-                bindings: vec![OutputBinding {
-                    from_pointer: "/findings".to_owned(),
-                    to_pointer: "/research_findings".to_owned(),
-                }],
             }],
         }
     }
@@ -506,7 +429,6 @@ mod tests {
         plan.dependencies.push(TaskDependency {
             from_task: "synthesis".to_owned(),
             to_task: "research".to_owned(),
-            bindings: Vec::new(),
         });
 
         let error = validate_plan(&plan).unwrap_err().to_string();
@@ -524,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_output_bindings() {
+    fn applies_dependency_inputs() {
         let plan = sample_plan();
         let mut outputs = BTreeMap::new();
         outputs.insert(
@@ -532,8 +454,13 @@ mod tests {
             json!({ "findings": [{ "name": "A" }] }),
         );
 
-        let input = apply_output_bindings(&plan, "synthesis", &json!({}), &outputs).unwrap();
-        assert_eq!(input, json!({ "research_findings": [{ "name": "A" }] }));
+        let input =
+            apply_dependency_inputs(&plan, "synthesis", &json!({ "audience": "exec" }), &outputs)
+                .unwrap();
+        assert_eq!(
+            input,
+            json!({ "audience": "exec", "findings": [{ "name": "A" }] })
+        );
     }
 
     #[test]
@@ -542,12 +469,5 @@ mod tests {
         let task = &plan.tasks[0];
         validate_task_output(task, &json!({ "findings": [] })).unwrap();
         assert!(validate_task_output(task, &json!({ "summary": "missing" })).is_err());
-    }
-
-    #[test]
-    fn unescapes_json_pointer_tokens() {
-        let mut output = json!({});
-        set_json_pointer(&mut output, "/a~1b/c~0d", json!(42)).unwrap();
-        assert_eq!(output, json!({ "a/b": { "c~d": 42 } }));
     }
 }

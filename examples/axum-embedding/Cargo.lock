@@ -279,6 +279,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cinder-core",
+ "cinder-store-postgres",
+ "cinder-store-sqlite",
  "reqwest",
  "serde",
  "serde_json",
@@ -289,6 +291,19 @@ dependencies = [
 
 [[package]]
 name = "cinder-store-postgres"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cinder-core",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "cinder-store-sqlite"
 version = "0.1.0"
 dependencies = [
  "async-trait",

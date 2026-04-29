@@ -1,0 +1,76 @@
+[store]
+kind = "sqlite"
+
+[store.sqlite]
+path = "./examples/math-proof-solver/data/cinder.db"
+
+[store.postgres]
+database_url = "postgres://cinder:cinder@127.0.0.1:55432/cinder"
+max_connections = 8
+
+[providers.hpcai]
+kind = "open_ai_compatible"
+base_url = "https://api.hpc-ai.com/inference/v1"
+api_key = "sk-a38c3f65d9de20995a0354c33631b5899662b64f3cd22c1e9927033bde87c47f73b88ebf"
+
+[providers.deepseek]
+kind = "open_ai_compatible"
+base_url = "https://api.deepseek.com"
+api_key = "sk-164f62660b02497b8147edf8c4c2d15b"
+
+[models.kimi25]
+alias = "kimi25"
+provider = "hpcai"
+model = "moonshotai/kimi-k2.5"
+max_output_tokens = 256000
+
+[models.deepseek-v4-pro]
+alias = "deepseek-v4-pro"
+provider = "deepseek"
+model = "deepseek-v4-pro"
+context_tokens = 1048576
+max_output_tokens = 393216
+
+
+[models.deepseek-v4-flash]
+alias = "deepseek-v4-flash"
+provider = "deepseek"
+model = "deepseek-v4-flash"
+context_tokens = 1048576
+max_output_tokens = 393216
+
+[agents.math-solver-agent]
+model = "deepseek-v4-flash"
+description = "Main math solver agent that dynamically creates TaskPlans and resumes after subagent work completes."
+tools = ["cinder.get_task", "cinder.submit_task", "cinder.list_agents", "cinder.spawn_task_plan"]
+system_prompt_file = "prompts/agents/math_solver.md"
+
+[agents.literature-agent]
+model = "deepseek-v4-flash"
+description = "Finds authoritative mathematical sources and records exactly what each source supports."
+tools = ["cinder.get_task", "cinder.submit_task"]
+system_prompt_file = "prompts/agents/literature.md"
+
+[agents.formal-verifier-agent]
+model = "deepseek-v4-flash"
+description = "Builds strict proof dependency trees and separates machine checked, literature checked, black box, sketch, and gap status."
+tools = ["cinder.get_task", "cinder.submit_task"]
+system_prompt_file = "prompts/agents/formal_verifier.md"
+
+[agents.curriculum-agent]
+model = "deepseek-v4-flash"
+description = "Maps proof dependencies to the target audience and identifies missing prerequisites or black boxes."
+tools = ["cinder.get_task", "cinder.submit_task"]
+system_prompt_file = "prompts/agents/curriculum.md"
+
+[agents.pedagogy-agent]
+model = "deepseek-v4-flash"
+description = "Translates strict proof structure into an audience-facing explanation while preserving proof status labels."
+tools = ["cinder.get_task", "cinder.submit_task"]
+system_prompt_file = "prompts/agents/pedagogy.md"
+
+[agents.rigor-critic-agent]
+model = "deepseek-v4-flash"
+description = "Reviews audience-facing explanations for hidden black boxes, overclaims, and proof sketches mislabeled as complete proofs."
+tools = ["cinder.get_task", "cinder.submit_task", "cinder.list_agents", "cinder.spawn_task_plan"]
+system_prompt_file = "prompts/agents/rigor_critic.md"

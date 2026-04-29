@@ -92,6 +92,16 @@ impl SqliteStore {
                 sqlx::query(statement).execute(&mut *tx).await?;
             }
         }
+        match sqlx::query(
+            "ALTER TABLE ai_messages ADD COLUMN provider_metadata TEXT NOT NULL DEFAULT '{}'",
+        )
+        .execute(&mut *tx)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.message().contains("duplicate column") => {}
+            Err(error) => return Err(error.into()),
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -248,9 +258,9 @@ impl SqliteStore {
     ) -> Result<RunMessage, StoreError> {
         let row = sqlx::query(
             r#"
-            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            RETURNING id, run_id, role, content, tool_calls, tool_call_id, created_at
+            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id, provider_metadata)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            RETURNING id, run_id, role, content, tool_calls, tool_call_id, provider_metadata, created_at
             "#,
         )
         .bind(run_id.to_string())
@@ -258,6 +268,7 @@ impl SqliteStore {
         .bind(&message.content)
         .bind(serde_json::to_string(&message.tool_calls)?)
         .bind(&message.tool_call_id)
+        .bind(serde_json::to_string(&message.provider_metadata)?)
         .fetch_one(&self.pool)
         .await?;
         message_from_row(&row)
@@ -266,7 +277,7 @@ impl SqliteStore {
     pub async fn list_messages(&self, run_id: Uuid) -> Result<Vec<RunMessage>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, run_id, role, content, tool_calls, tool_call_id, created_at
+            SELECT id, run_id, role, content, tool_calls, tool_call_id, provider_metadata, created_at
             FROM ai_messages
             WHERE run_id = ?1
             ORDER BY id ASC
@@ -350,8 +361,8 @@ impl SqliteStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id)
-            VALUES (?1, ?2, ?3, '[]', ?4)
+            INSERT INTO ai_messages (run_id, role, content, tool_calls, tool_call_id, provider_metadata)
+            VALUES (?1, ?2, ?3, '[]', ?4, '{}')
             "#,
         )
         .bind(run_id.to_string())
@@ -459,6 +470,8 @@ impl SqliteStore {
         target_id: Option<&str>,
         parent_plan_run_id: Option<Uuid>,
         parent_task_id: Option<&str>,
+        parent_agent_run_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<TaskPlanRun, StoreError> {
         cinder_core::validate_plan(plan)?;
         let plan_run_id = Uuid::new_v4();
@@ -466,21 +479,24 @@ impl SqliteStore {
         let row = sqlx::query(
             r#"
             INSERT INTO ai_task_plan_runs (
-                id, plan, root_task_id, status, parent_plan_run_id,
-                parent_task_id, user_id, target_id
+                id, plan, status, parent_plan_run_id,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                user_id, target_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             RETURNING id, plan, status, result, last_error, parent_plan_run_id,
-                parent_task_id, user_id, target_id, locked_at, locked_by,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                parent_delivered_at, user_id, target_id, locked_at, locked_by,
                 created_at, updated_at
             "#,
         )
         .bind(plan_run_id.to_string())
         .bind(serde_json::to_string(plan)?)
-        .bind(&plan.root_task_id)
         .bind(PlanRunStatus::Running.to_string())
         .bind(parent_plan_run_id.map(|id| id.to_string()))
         .bind(parent_task_id)
+        .bind(parent_agent_run_id.map(|id| id.to_string()))
+        .bind(parent_tool_call_id)
         .bind(user_id)
         .bind(target_id)
         .fetch_one(&mut *tx)
@@ -511,7 +527,8 @@ impl SqliteStore {
         let row = sqlx::query(
             r#"
             SELECT id, plan, status, result, last_error, parent_plan_run_id,
-                parent_task_id, user_id, target_id, locked_at, locked_by,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                parent_delivered_at, user_id, target_id, locked_at, locked_by,
                 created_at, updated_at
             FROM ai_task_plan_runs
             WHERE id = ?1
@@ -557,6 +574,47 @@ impl SqliteStore {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(task_run_from_row).transpose()
+    }
+
+    pub async fn list_undelivered_task_plan_runs_by_parent_run(
+        &self,
+        parent_agent_run_id: Uuid,
+    ) -> Result<Vec<TaskPlanRun>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, plan, status, result, last_error, parent_plan_run_id,
+                parent_task_id, parent_agent_run_id, parent_tool_call_id,
+                parent_delivered_at, user_id, target_id, locked_at, locked_by,
+                created_at, updated_at
+            FROM ai_task_plan_runs
+            WHERE parent_agent_run_id = ?1
+              AND parent_delivered_at IS NULL
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(parent_agent_run_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(task_plan_run_from_row).collect()
+    }
+
+    pub async fn mark_task_plan_parent_delivered(
+        &self,
+        plan_run_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            UPDATE ai_task_plan_runs
+            SET parent_delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(plan_run_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn acquire_task_plan_lock(
@@ -794,6 +852,7 @@ CREATE TABLE IF NOT EXISTS ai_messages (
     content TEXT NOT NULL DEFAULT '',
     tool_calls TEXT NOT NULL DEFAULT '[]',
     tool_call_id TEXT,
+    provider_metadata TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -819,12 +878,14 @@ CREATE INDEX IF NOT EXISTS idx_ai_tool_tasks_claim
 CREATE TABLE IF NOT EXISTS ai_task_plan_runs (
     id TEXT PRIMARY KEY,
     plan TEXT NOT NULL,
-    root_task_id TEXT NOT NULL,
     status TEXT NOT NULL,
     result TEXT,
     last_error TEXT,
     parent_plan_run_id TEXT REFERENCES ai_task_plan_runs(id) ON DELETE CASCADE,
     parent_task_id TEXT,
+    parent_agent_run_id TEXT REFERENCES ai_runs(id) ON DELETE CASCADE,
+    parent_tool_call_id TEXT,
+    parent_delivered_at TEXT,
     user_id TEXT,
     target_id TEXT,
     locked_at TEXT,
@@ -836,6 +897,8 @@ CREATE TABLE IF NOT EXISTS ai_task_plan_runs (
 CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_status ON ai_task_plan_runs(status);
 CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_parent
     ON ai_task_plan_runs(parent_plan_run_id, parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_parent_agent
+    ON ai_task_plan_runs(parent_agent_run_id, parent_delivered_at);
 CREATE INDEX IF NOT EXISTS idx_ai_task_plan_runs_lock ON ai_task_plan_runs(locked_at);
 
 CREATE TABLE IF NOT EXISTS ai_task_plan_task_runs (
@@ -898,6 +961,7 @@ fn message_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunMessage, StoreEr
         content: row.try_get("content")?,
         tool_calls: serde_json::from_str(&row.try_get::<String, _>("tool_calls")?)?,
         tool_call_id: row.try_get("tool_call_id")?,
+        provider_metadata: serde_json::from_str(&row.try_get::<String, _>("provider_metadata")?)?,
         created_at: parse_time(row.try_get("created_at")?)?,
     })
 }
@@ -929,6 +993,9 @@ fn task_plan_run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TaskPlanRun, 
         last_error: row.try_get("last_error")?,
         parent_plan_run_id: parse_optional_uuid(row.try_get("parent_plan_run_id")?)?,
         parent_task_id: row.try_get("parent_task_id")?,
+        parent_agent_run_id: parse_optional_uuid(row.try_get("parent_agent_run_id")?)?,
+        parent_tool_call_id: row.try_get("parent_tool_call_id")?,
+        parent_delivered_at: parse_optional_time(row.try_get("parent_delivered_at")?)?,
         user_id: row.try_get("user_id")?,
         target_id: row.try_get("target_id")?,
         locked_at: parse_optional_time(row.try_get("locked_at")?)?,
@@ -1135,6 +1202,8 @@ impl CinderStore for SqliteStore {
         target_id: Option<&str>,
         parent_plan_run_id: Option<Uuid>,
         parent_task_id: Option<&str>,
+        parent_agent_run_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<TaskPlanRun, CinderCoreError> {
         SqliteStore::create_task_plan_run(
             self,
@@ -1143,6 +1212,8 @@ impl CinderStore for SqliteStore {
             target_id,
             parent_plan_run_id,
             parent_task_id,
+            parent_agent_run_id,
+            parent_tool_call_id,
         )
         .await
         .map_err(Into::into)
@@ -1168,6 +1239,24 @@ impl CinderStore for SqliteStore {
         agent_run_id: Uuid,
     ) -> Result<Option<TaskRun>, CinderCoreError> {
         SqliteStore::get_task_run_by_agent_run(self, agent_run_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_undelivered_task_plan_runs_by_parent_run(
+        &self,
+        parent_agent_run_id: Uuid,
+    ) -> Result<Vec<TaskPlanRun>, CinderCoreError> {
+        SqliteStore::list_undelivered_task_plan_runs_by_parent_run(self, parent_agent_run_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_task_plan_parent_delivered(
+        &self,
+        plan_run_id: Uuid,
+    ) -> Result<(), CinderCoreError> {
+        SqliteStore::mark_task_plan_parent_delivered(self, plan_run_id)
             .await
             .map_err(Into::into)
     }

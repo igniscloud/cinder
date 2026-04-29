@@ -85,6 +85,8 @@ pub trait CinderStore: Send + Sync {
         target_id: Option<&str>,
         parent_plan_run_id: Option<Uuid>,
         parent_task_id: Option<&str>,
+        parent_agent_run_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<TaskPlanRun, CinderCoreError>;
     async fn get_task_plan_run(
         &self,
@@ -95,6 +97,14 @@ pub trait CinderStore: Send + Sync {
         &self,
         agent_run_id: Uuid,
     ) -> Result<Option<TaskRun>, CinderCoreError>;
+    async fn list_undelivered_task_plan_runs_by_parent_run(
+        &self,
+        parent_agent_run_id: Uuid,
+    ) -> Result<Vec<TaskPlanRun>, CinderCoreError>;
+    async fn mark_task_plan_parent_delivered(
+        &self,
+        plan_run_id: Uuid,
+    ) -> Result<(), CinderCoreError>;
     async fn acquire_task_plan_lock(
         &self,
         plan_run_id: Uuid,

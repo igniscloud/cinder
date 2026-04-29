@@ -1,21 +1,225 @@
 use anyhow::{anyhow, Context, Result};
 use cinder_core::{
-    AgentSpec, CinderStore, Message, MessageRole, Provider, ProviderRequest, RunStatus, Skill,
-    SkillSpec, Tool, ToolContext, ToolExecutionMode, ToolSpec,
+    AgentSpec, CinderConfig, CinderStore, Message, MessageRole, PlanRunStatus, Provider,
+    ProviderRequest, RunStatus, Skill, SkillSpec, TaskPlan, Tool, ToolContext, ToolExecutionMode,
+    ToolSpec,
 };
+use cinder_store_postgres::PostgresStore;
+use cinder_store_sqlite::SqliteStore;
+use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error};
 use uuid::Uuid;
 
+const CINDER_AGENT_SYSTEM_PROMPT: &str = include_str!("../system_prompts/cinder_agent.md");
+
 pub mod config;
 pub mod taskplan;
 pub mod tools;
 pub use config::OpenAiCompatibleProvider;
 pub use taskplan::{CreateTaskPlanRun, TaskPlanOutcome, TaskPlanRuntime, TaskPlanRuntimeOptions};
-pub use tools::{ListAgentsTool, SpawnTaskPlanTool, SubmitTaskTool};
+pub use tools::{GetTaskTool, ListAgentsTool, SpawnTaskPlanTool, SubmitTaskTool};
+
+#[derive(Clone)]
+pub enum Cinder {
+    Sqlite(CinderInner<SqliteStore>),
+    Postgres(CinderInner<PostgresStore>),
+}
+
+#[derive(Clone)]
+pub struct CinderInner<S>
+where
+    S: CinderStore + Clone + 'static,
+{
+    store: S,
+    task_plan_runtime: TaskPlanRuntime,
+    worker_poll_interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskPlanRunView {
+    pub id: Uuid,
+    pub status: PlanRunStatus,
+    pub result: Option<Value>,
+    pub last_error: Option<String>,
+}
+
+impl Cinder {
+    pub async fn from_config_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let config = CinderConfig::load(path).map_err(|error| anyhow!(error))?;
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        Self::from_config(config, base_dir).await
+    }
+
+    pub async fn from_config(config: CinderConfig, base_dir: impl AsRef<Path>) -> Result<Self> {
+        match config.store.kind {
+            cinder_core::StoreKind::Sqlite => {
+                let sqlite = config
+                    .store
+                    .sqlite
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("store.sqlite is required"))?;
+                let store = SqliteStore::connect_from_config(sqlite).await?;
+                Ok(Self::Sqlite(
+                    CinderInner::from_store(store, &config, base_dir.as_ref()).await?,
+                ))
+            }
+            cinder_core::StoreKind::Postgres => {
+                let postgres = config
+                    .store
+                    .postgres
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("store.postgres is required"))?;
+                let store = PostgresStore::connect_from_config(postgres).await?;
+                Ok(Self::Postgres(
+                    CinderInner::from_store(store, &config, base_dir.as_ref()).await?,
+                ))
+            }
+        }
+    }
+
+    pub async fn submit_task_plan(&self, plan: TaskPlan) -> Result<Uuid> {
+        match self {
+            Self::Sqlite(inner) => inner.submit_task_plan(plan).await,
+            Self::Postgres(inner) => inner.submit_task_plan(plan).await,
+        }
+    }
+
+    pub async fn get_task_plan(&self, plan_run_id: Uuid) -> Result<Option<TaskPlanRunView>> {
+        match self {
+            Self::Sqlite(inner) => inner.get_task_plan(plan_run_id).await,
+            Self::Postgres(inner) => inner.get_task_plan(plan_run_id).await,
+        }
+    }
+
+    pub async fn task_plan_result(&self, plan_run_id: Uuid) -> Result<Option<Value>> {
+        Ok(self
+            .get_task_plan(plan_run_id)
+            .await?
+            .and_then(|run| (run.status == PlanRunStatus::Completed).then_some(run.result))
+            .flatten())
+    }
+
+    pub async fn wait_task_plan_result(
+        &self,
+        plan_run_id: Uuid,
+        timeout: Duration,
+    ) -> Result<Value> {
+        match self {
+            Self::Sqlite(inner) => inner.wait_task_plan_result(plan_run_id, timeout).await,
+            Self::Postgres(inner) => inner.wait_task_plan_result(plan_run_id, timeout).await,
+        }
+    }
+}
+
+impl<S> CinderInner<S>
+where
+    S: CinderStore + Clone + 'static,
+{
+    async fn from_store(store: S, config: &CinderConfig, base_dir: &Path) -> Result<Self> {
+        store.init_schema().await.map_err(|error| anyhow!(error))?;
+        let agent_runtime = AgentRuntime::from_config(store.clone(), config, base_dir).await?;
+        Ok(Self {
+            store: store.clone(),
+            task_plan_runtime: TaskPlanRuntime::new(store, agent_runtime),
+            worker_poll_interval: Duration::from_secs(1),
+        })
+    }
+
+    async fn submit_task_plan(&self, plan: TaskPlan) -> Result<Uuid> {
+        let plan_run_id = self
+            .task_plan_runtime
+            .create_plan_run(CreateTaskPlanRun {
+                plan,
+                user_id: None,
+                target_id: None,
+                parent_plan_run_id: None,
+                parent_task_id: None,
+            })
+            .await?;
+        self.spawn_task_plan_worker(plan_run_id);
+        Ok(plan_run_id)
+    }
+
+    async fn get_task_plan(&self, plan_run_id: Uuid) -> Result<Option<TaskPlanRunView>> {
+        Ok(self
+            .store
+            .get_task_plan_run(plan_run_id)
+            .await?
+            .map(|run| TaskPlanRunView {
+                id: run.id,
+                status: run.status,
+                result: run.result,
+                last_error: run.last_error,
+            }))
+    }
+
+    async fn wait_task_plan_result(&self, plan_run_id: Uuid, timeout: Duration) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let run = self
+                .get_task_plan(plan_run_id)
+                .await?
+                .ok_or_else(|| anyhow!("task plan run not found: {plan_run_id}"))?;
+            match run.status {
+                PlanRunStatus::Completed => {
+                    return run.result.ok_or_else(|| {
+                        anyhow!("task plan `{plan_run_id}` completed without result")
+                    });
+                }
+                PlanRunStatus::Failed | PlanRunStatus::Cancelled => {
+                    return Err(anyhow!(
+                        "task plan `{plan_run_id}` ended with status {}: {}",
+                        run.status,
+                        run.last_error
+                            .unwrap_or_else(|| "no error detail".to_owned())
+                    ));
+                }
+                PlanRunStatus::Running => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "task plan `{plan_run_id}` did not finish before timeout"
+                        ));
+                    }
+                    sleep(self.worker_poll_interval).await;
+                }
+            }
+        }
+    }
+
+    fn spawn_task_plan_worker(&self, plan_run_id: Uuid) {
+        let runtime = self.task_plan_runtime.clone();
+        let store = self.store.clone();
+        let poll_interval = self.worker_poll_interval;
+        tokio::spawn(async move {
+            loop {
+                match runtime.advance_plan(plan_run_id).await {
+                    Ok(TaskPlanOutcome::Completed { .. } | TaskPlanOutcome::Failed { .. }) => {
+                        break;
+                    }
+                    Ok(TaskPlanOutcome::Running | TaskPlanOutcome::Busy) => {
+                        sleep(poll_interval).await;
+                    }
+                    Err(error) => {
+                        error!(plan_run_id = %plan_run_id, error = %error, "task plan worker failed");
+                        if let Err(fail_error) = store
+                            .fail_task_plan_run(plan_run_id, &error.to_string())
+                            .await
+                        {
+                            error!(plan_run_id = %plan_run_id, error = %fail_error, "failed to mark task plan failed");
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentRuntime {
@@ -144,7 +348,8 @@ impl AgentRuntime {
                 max_internal_turns: config.runtime.max_internal_turns,
                 ..RuntimeOptions::default()
             })
-            .tool(ListAgentsTool);
+            .tool(ListAgentsTool)
+            .tool(GetTaskTool);
         builder = builder.tool(SpawnTaskPlanTool).tool(SubmitTaskTool);
 
         for (provider_id, provider_config) in &config.providers {
@@ -473,7 +678,10 @@ impl AgentRuntime {
     }
 
     fn system_prompt_for_agent(&self, agent: &AgentSpec) -> Result<String> {
-        let mut parts = vec![agent.system_prompt.clone()];
+        let mut parts = vec![
+            CINDER_AGENT_SYSTEM_PROMPT.trim().to_owned(),
+            agent.system_prompt.clone(),
+        ];
         for skill in self.skill_specs_for_agent(agent)? {
             if let Some(prompt) = skill.system_prompt {
                 parts.push(prompt);

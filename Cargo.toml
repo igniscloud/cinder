@@ -7,7 +7,7 @@ members = [
 ]
 exclude = [
     "examples/axum-embedding",
-    "examples/math-proof-taskplan",
+    "examples/math-proof-solver",
 ]
 resolver = "2"
 
