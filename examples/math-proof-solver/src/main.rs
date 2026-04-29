@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("examples/math-proof-solver/cinder.toml"));
     let question = std::env::args().nth(2).unwrap_or_else(|| {
-        "Explain why Fermat's Last Theorem is true for a high-school audience, without pretending that advanced mathematics can be removed.".to_owned()
+        "Prove that sqrt(2) is irrational. Use exactly one child TaskPlan task with the formal-verifier-agent to verify the proof before the final answer, and keep the final answer concise.".to_owned()
     });
 
     let cinder = Cinder::from_config_path(&config_path).await?;

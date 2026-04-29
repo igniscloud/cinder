@@ -1,11 +1,11 @@
-# Config, Model Alias, and Store Implementation Plan
+# Config, Model, and Store Implementation Plan
 
 ## Goals
 
 - Use one `cinder.toml` to configure store, providers, models, agents, and runtime defaults.
 - Do not support environment-variable based config in this phase.
 - Support `sqlite` and `postgres` stores from config.
-- Support model aliases; aliases must be unique and agents reference models through the `model` field.
+- Agents reference model definitions by the `[models.<id>]` table name through the `model` field.
 - Keep manual Rust registration available for advanced embedding.
 
 ## Config Shape
@@ -27,7 +27,6 @@ base_url = "https://api.hpc-ai.com/inference/v1"
 api_key = "..."
 
 [models.kimi25]
-alias = "kimi25"
 provider = "hpcai"
 model = "moonshotai/kimi-k2.5"
 temperature = 0.2
@@ -50,4 +49,4 @@ tools = ["taskplan.spawn_task_plan", "taskplan.submit_task"]
 5. Refactor `cinder-runtime` to depend on `Arc<dyn CinderStore>` instead of `PostgresStore`.
 6. Add config loading helpers that build providers, models, agents, and stores from concrete config values.
 7. Update examples so database/provider/model/agents come from config files.
-8. Add tests for config validation, duplicate model aliases, SQLite execution, and Postgres regression.
+8. Add tests for config validation, unknown model references, SQLite execution, and Postgres regression.

@@ -1,0 +1,5 @@
+{
+  "solve": {
+    "markdown": "## √2 Is Irrational — Proof by Contradiction\n\n**Proof.** Suppose √2 is rational. Then √2 = a/b where a, b are integers, b ≠ 0, and the fraction is in lowest terms (gcd(a, b) = 1).\n\nSquare both sides: 2 = a²/b² → **a² = 2b²**. So a² is even.\n\n*Lemma:* If a² is even, then a is even. (An odd squared is odd: (2m+1)² = 4m²+4m+1 = 2(2m²+2m)+1.)\n\nThus a = 2k for some integer k. Substitute: (2k)² = 2b² → 4k² = 2b² → **b² = 2k²**. So b² is even, hence b is even.\n\nNow both a and b are even, so gcd(a, b) ≥ 2 — contradicting that a/b is in lowest terms.\n\nTherefore √2 cannot be rational. ∎\n\n---\n*Proof status: verified — no gaps. All dependencies (rational definition, gcd reduction, parity lemma, logical framework) are literature-checked or machine-checked.*"
+  }
+}

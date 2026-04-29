@@ -1,6 +1,6 @@
 use crate::{AgentSpec, CinderCoreError};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -39,13 +39,8 @@ impl CinderConfig {
             provider.validate(provider_id)?;
         }
 
-        let mut aliases = BTreeSet::new();
         for (model_id, model) in &self.models {
             validate_key(model_id, "model id")?;
-            validate_non_empty(&model.alias, "model.alias")?;
-            if !aliases.insert(model.alias.clone()) {
-                return config_err(format!("duplicate model alias `{}`", model.alias));
-            }
             validate_non_empty(&model.provider, "model.provider")?;
             if !self.providers.contains_key(&model.provider) {
                 return config_err(format!(
@@ -60,9 +55,9 @@ impl CinderConfig {
             validate_key(agent_id, "agent id")?;
             validate_non_empty(&agent.description, "agent.description")?;
             validate_non_empty(&agent.model, "agent.model")?;
-            if self.model_by_alias(&agent.model).is_none() {
+            if self.model_by_id(&agent.model).is_none() {
                 return config_err(format!(
-                    "agent `{agent_id}` references unknown model alias `{}`",
+                    "agent `{agent_id}` references unknown model `{}`",
                     agent.model
                 ));
             }
@@ -84,8 +79,8 @@ impl CinderConfig {
         Ok(())
     }
 
-    pub fn model_by_alias(&self, alias: &str) -> Option<&ModelConfig> {
-        self.models.values().find(|model| model.alias == alias)
+    pub fn model_by_id(&self, model_id: &str) -> Option<&ModelConfig> {
+        self.models.get(model_id)
     }
 
     pub fn agent_specs(
@@ -97,9 +92,9 @@ impl CinderConfig {
         self.agents
             .iter()
             .map(|(agent_id, agent)| {
-                let model = self.model_by_alias(&agent.model).ok_or_else(|| {
+                let model = self.model_by_id(&agent.model).ok_or_else(|| {
                     CinderCoreError::Config(format!(
-                        "agent `{agent_id}` references unknown model alias `{}`",
+                        "agent `{agent_id}` references unknown model `{}`",
                         agent.model
                     ))
                 })?;
@@ -225,7 +220,6 @@ pub struct OpenAiCompatibleProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
-    pub alias: String,
     pub provider: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,7 +334,6 @@ mod tests {
             api_key = "test"
 
             [models.kimi25]
-            alias = "kimi25"
             provider = "hpcai"
             model = "moonshotai/kimi-k2.5"
 
@@ -359,27 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_model_aliases() {
+    fn rejects_unknown_agent_model() {
         let mut config = valid_config();
-        config.models.insert(
-            "other".to_owned(),
-            ModelConfig {
-                alias: "kimi25".to_owned(),
-                provider: "hpcai".to_owned(),
-                model: "other".to_owned(),
-                temperature: None,
-                context_tokens: None,
-                max_output_tokens: None,
-                max_tokens: None,
-            },
-        );
+        config.agents.get_mut("orchestrator").unwrap().model = "missing".to_owned();
 
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("duplicate model alias"));
+        assert!(error.contains("unknown model `missing`"));
     }
 
     #[test]
-    fn builds_agent_specs_from_aliases() {
+    fn builds_agent_specs_from_model_ids() {
         let specs = valid_config().agent_specs(".").unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].id, "orchestrator");

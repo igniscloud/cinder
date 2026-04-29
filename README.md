@@ -78,7 +78,7 @@ submit a `TaskPlan`, then wait for or query its result; they do not manually
 advance execution.
 
 It uses `examples/math-proof-solver/cinder.toml` for the database, provider,
-model alias, and agent definitions. Edit the API key directly in that file before
+model, and agent definitions. Edit the API key directly in that file before
 running; environment variable config is intentionally not used in this phase.
 
 ```bash
