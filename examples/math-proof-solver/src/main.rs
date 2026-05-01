@@ -37,16 +37,19 @@ fn root_plan(question: &str) -> TaskPlan {
         tasks: vec![TaskSpec {
             id: "solve".to_owned(),
             agent_id: SOLVER_AGENT_ID.to_owned(),
-            prompt: "Solve the user's mathematics request. Use cinder.list_agents and cinder.spawn_task_plan when specialist sub-work is needed. When the final answer is ready, submit JSON with a markdown string field.".to_owned(),
+            prompt: "Solve the user's mathematics request. Use cinder.list_agents and cinder.spawn_task_plan when specialist sub-work is needed. When the final answer is ready, submit JSON with a latex string field.".to_owned(),
             input: json!({
                 "question": question,
                 "audience": "high_school"
             }),
             output_schema: json!({
                 "type": "object",
-                "required": ["markdown"],
+                "required": ["latex"],
                 "properties": {
-                    "markdown": { "type": "string" }
+                    "latex": {
+                        "type": "string",
+                        "description": "Final answer text. All mathematical notation, symbols, formulas, and equations must be written in LaTeX."
+                    }
                 },
                 "additionalProperties": true
             }),
